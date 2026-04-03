@@ -252,46 +252,32 @@ apply_tracker_exclusions <- function(df, excl_wide, pattern) {
 #' # appends: irr_mean, irr_n_used, irr_n_invalid, irr_n_dropped, irr_iterations
 
 add_robust_mean <- function(df,
-                            pattern,
-                            threshold     = 0.05,
-                            max_iter      = 5,
-                            min_vals      = 2,
-                            output_prefix = NULL) {
+                             pattern,
+                             threshold     = 0.05,
+                             max_iter      = 5,
+                             min_vals      = 2,
+                             output_prefix = pattern) {
+
 
   sensor_df <- select(df, matches(pattern))
 
-  if (ncol(sensor_df) == 0L)
-    cli_abort("No columns matched pattern {.val {pattern}}")
 
-  # Derive a clean column prefix from the regex when none is explicitly supplied:
-  #   1. Strip leading ^ and trailing $ anchors
-  #   2. Remove remaining regex metacharacters ([, ], +, ?, etc.)
-  #   3. Ensure a trailing _ separator
-  if (is.null(output_prefix)) {
-    output_prefix <- pattern |>
-      gsub("^\\^|\\$$", "", x = _) |>
-      gsub("[^[:alnum:]_.]", "", x = _)
-    if (!endsWith(output_prefix, "_"))
-      output_prefix <- paste0(output_prefix, "_")
-  }
+  if (ncol(sensor_df) == 0)
+    cli::cli_abort("No columns matched pattern {.val {pattern}}")
 
-  # Apply robust_sensor_mean row-wise across matched sensor columns
-  results <- pmap(
-    sensor_df,
-    \(...) robust_sensor_mean(
-      c(...),
-      threshold = threshold,
-      max_iter  = max_iter,
-      min_vals  = min_vals
-    )
-  ) |>
+
+  results <- sensor_df |>
+    pmap(\(...) robust_sensor_mean(c(...),
+                                   threshold = threshold,
+                                   max_iter  = max_iter,
+                                   min_vals  = min_vals)) |>
     list_rbind() |>
-    rename_with(\(x) paste0(output_prefix, x))
-  # → e.g. irr_mean, irr_n_used, irr_n_invalid, irr_n_dropped, irr_iterations
+    rename_with(~ paste0(output_prefix, .x))
+    # → irr_mean, irr_n_used, irr_n_dropped, irr_iterations
+
 
   bind_cols(df, results)
 }
-
 
 # Period exclusions (non-equi overlap join) ------------------------------
 
@@ -359,4 +345,111 @@ apply_period_exclusions <- function(df,
 
   # Either return all rows (with reason column) or drop excluded rows silently
   if (keep_excluded) result else filter(result, is.na(reason))
+}
+
+
+# Day by day trellis plot ------------------------------------------------
+
+#' Daily Trellis Line Plot
+#'
+#' Creates a \code{facet_wrap} trellis of intraday line profiles, one panel per
+#' calendar day. All panels share the same 00:00–24:00 x-axis so daily shapes
+#' are directly comparable. Designed for long-format time series data such as
+#' inverter power, irradiance, or meter readings at sub-hourly resolution.
+#'
+#' @param data          A data frame in long format.
+#' @param timestamp_col \code{<data-masking>} Unquoted name of the \code{POSIXct}
+#'   datetime column.
+#' @param value_col     \code{<data-masking>} Unquoted name of the numeric column
+#'   to plot on the y-axis.
+#' @param color_col     \code{<data-masking>} Unquoted name of the column used to
+#'   colour and group lines within each panel (e.g. inverter ID, device name).
+#' @param ncol          Integer or \code{NULL}. Number of facet columns passed to
+#'   \code{\link[ggplot2]{facet_wrap}}. \code{NULL} lets ggplot2 decide.
+#'   Default: \code{NULL}.
+#' @param time_breaks   Character string passed to \code{date_breaks} in
+#'   \code{\link[ggplot2]{scale_x_datetime}} (e.g. \code{"2 hours"},
+#'   \code{"30 mins"}). Default: \code{"4 hours"}.
+#' @param date_format   \code{strftime} format string used to label each facet
+#'   panel. Default: \code{"\%d \%b"} (e.g. \code{"03 Apr"}).
+#' @param title         Character string for the plot title, or \code{NULL}.
+#'   Default: \code{NULL}.
+#' @param subtitle      Character string for the plot subtitle, or \code{NULL}.
+#'   Default: \code{NULL}.
+#' @param ...           Additional arguments forwarded to
+#'   \code{\link[ggplot2]{facet_wrap}}, such as \code{scales = "free_y"} or
+#'   \code{nrow = 2}.
+#'
+#' @return A \code{\link[ggplot2]{ggplot}} object. Can be further customised
+#'   with additional \code{ggplot2} layers (e.g. \code{+ ylab("kW")},
+#'   \code{+ scale_color_manual()}).
+#'
+#' @importFrom ggplot2 ggplot aes geom_line facet_wrap scale_x_datetime labs
+#'   theme_minimal theme element_rect element_text element_blank
+#' @importFrom lubridate as_date update
+#' @importFrom dplyr mutate
+#'
+#' @examples
+#' \dontrun{
+#' plot_daily_trellis(
+#'   data          = df_inverters,
+#'   timestamp_col = timestamp,
+#'   value_col     = power_kw,
+#'   color_col     = inverter_id,
+#'   ncol          = 7,
+#'   time_breaks   = "2 hours",
+#'   date_format   = "%d %b",
+#'   title         = "Daily AC Power by Inverter",
+#'   scales        = "free_y"
+#' ) +
+#'   ylab("kW")
+#' }
+#'
+plot_daily_trellis <- function(data,
+                               timestamp_col,
+                               value_col,
+                               color_col,
+                               ncol        = NULL,
+                               time_breaks = "4 hours",
+                               date_format = "%d %b",
+                               title       = NULL,
+                               subtitle    = NULL,
+                               ...) {
+
+  data |>
+    mutate(
+      .date = as_date({{ timestamp_col }}),
+
+      # Pin all timestamps to 1970-01-01 so scale_x_datetime produces a
+      # consistent 00:00–24:00 x-axis across all facets
+      .time = {{ timestamp_col }},
+
+      # Ordered factor ensures facets appear in chronological order,
+      # not alphabetical — critical for non-ISO date_format strings
+      .date_label = factor(
+        format(.date, date_format),
+        levels = unique(format(sort(unique(.date)), date_format))
+      )
+    ) |>
+    ggplot(aes(x = .time, y = {{ value_col }}, color = {{ color_col }})) +
+    geom_line(linewidth = 0.6, na.rm = TRUE) +
+    facet_wrap(~.date_label, ncol = ncol, ..., scales = "free_x") +
+    scale_x_datetime(
+      date_breaks = time_breaks,
+      date_labels = "%H:%M"
+    ) +
+    labs(
+      x        = NULL,
+      y        = NULL,
+      title    = title,
+      subtitle = subtitle
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      strip.background = element_rect(fill = "grey92", color = NA),
+      strip.text       = element_text(face = "bold", size = 8),
+      panel.grid.minor = element_blank(),
+      legend.position  = "bottom",
+      axis.text.x      = element_text(angle = 45, hjust = 1, size = 7)
+    )
 }
